@@ -471,19 +471,11 @@ async def run_session(
     if model:
         session_kwargs["model"] = model
 
-    try:
-        from copilot.generated.session_events import (
-            AssistantMessageData,
-            AssistantMessageDeltaData,
-            SessionIdleData,
-        )
-    except ImportError:
-        # Older SDK versions may use a different import path
-        from copilot.session_events import (  # type: ignore[no-redef]
-            AssistantMessageData,
-            AssistantMessageDeltaData,
-            SessionIdleData,
-        )
+    from copilot.generated.session_events import SessionEventType
+
+    def _event_type(event) -> str:
+        et = getattr(event, "type", "")
+        return str(getattr(et, "value", et))
 
     async with CopilotClient(config) as client:
         async with await client.create_session(**session_kwargs) as session:
@@ -493,11 +485,12 @@ async def run_session(
                 seed_done = asyncio.Event()
 
                 def _on_seed(event):
-                    match event.data:
-                        case AssistantMessageData():
-                            seed_done.set()
-                        case SessionIdleData():
-                            seed_done.set()
+                    et = _event_type(event)
+                    if et in (
+                        SessionEventType.ASSISTANT_MESSAGE.value,
+                        SessionEventType.SESSION_IDLE.value,
+                    ):
+                        seed_done.set()
 
                 unsub_seed = session.on(_on_seed)
                 await session.send(initial_context)
@@ -534,14 +527,19 @@ async def run_session(
                 print("\nAssistant: ", end="", flush=True)
 
                 def on_event(event):
-                    match event.data:
-                        case AssistantMessageDeltaData() as data:
-                            delta = data.delta_content or ""
-                            print(delta, end="", flush=True)
-                        case AssistantMessageData():
-                            print()  # ensure newline after full message
-                        case SessionIdleData():
-                            response_done.set()
+                    et = _event_type(event)
+                    # Support both current "assistant.message_delta" and legacy
+                    # docs/examples that use "assistant.message.delta".
+                    if et in (
+                        SessionEventType.ASSISTANT_MESSAGE_DELTA.value,
+                        "assistant.message.delta",
+                    ):
+                        delta = getattr(event.data, "delta_content", "") or ""
+                        print(delta, end="", flush=True)
+                    elif et == SessionEventType.ASSISTANT_MESSAGE.value:
+                        print()  # ensure newline after full message
+                    elif et == SessionEventType.SESSION_IDLE.value:
+                        response_done.set()
 
                 unsub = session.on(on_event)
                 send_kwargs: dict = {"prompt": user_input}
