@@ -20,6 +20,12 @@ Drop raw footage in a folder, chat with Claude Code, get `final.mp4` back. Works
 
 ## Get started
 
+Two ways to run video-use — pick the one that matches your subscription:
+
+### Option A — Claude Code (original)
+
+Requires an Anthropic API subscription or Claude Pro.
+
 ```bash
 # 1. Clone and symlink into Claude Code's skills directory
 git clone https://github.com/browser-use/video-use
@@ -41,6 +47,44 @@ Then point Claude Code at a folder of raw takes:
 ```bash
 cd /path/to/your/videos
 claude
+```
+
+### Option B — GitHub Copilot (no Anthropic key required)
+
+Uses your existing GitHub Copilot subscription as the LLM backend via the
+OpenAI-compatible Copilot API. Same pipeline, same production rules, same helpers.
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/browser-use/video-use
+cd video-use
+
+# 2. Install deps (includes the openai SDK)
+pip install -e ".[copilot]"
+brew install ffmpeg           # required
+brew install yt-dlp            # optional
+
+# 3. Configure API keys
+cp .env.example .env
+$EDITOR .env
+#   ELEVENLABS_API_KEY=...    ← for transcription (same as before)
+#   GITHUB_TOKEN=...          ← PAT with 'copilot' scope
+#                               https://github.com/settings/tokens
+```
+
+Then run the orchestrator against your video folder:
+
+```bash
+python /path/to/video-use/orchestrator.py /path/to/your/videos
+```
+
+Available options:
+
+```
+--model gpt-4o          # default; also: gpt-4o-mini, claude-3.5-sonnet, o3-mini
+--endpoint <url>        # default: https://api.githubcopilot.com
+                        # GitHub Models alternative: https://models.inference.ai.azure.com
+--max-turns 100         # safety cap on LLM turns (default: 100)
 ```
 
 And in the session:
