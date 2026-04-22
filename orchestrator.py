@@ -37,6 +37,23 @@ REPO_ROOT = Path(__file__).resolve().parent
 HELPERS_DIR = REPO_ROOT / "helpers"
 SKILL_MD = REPO_ROOT / "SKILL.md"
 
+
+def _load_env_file() -> None:
+    """Load key=value pairs from .env into os.environ (does not overwrite existing vars)."""
+    for candidate in [REPO_ROOT / ".env", Path(".env")]:
+        if candidate.exists():
+            for line in candidate.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+            break
+
+
 # ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
@@ -353,11 +370,21 @@ def _format_result(returncode: int, stdout: str, stderr: str) -> str:
     return "\n".join(parts)
 
 
+def _is_under(path: Path, parent: Path) -> bool:
+    """Return True if *path* is the same as or nested under *parent*."""
+    try:
+        path.relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def dispatch_tool(
     name: str,
     args: dict,
     videos_dir: Path,
     edit_dir: Path,
+    enable_bash: bool = False,
 ) -> tuple[str, Path | None]:
     """Execute a tool call. Returns (result_text, optional_image_path)."""
 
@@ -376,7 +403,8 @@ def dispatch_tool(
         return _format_result(rc, out, err), None
 
     if name == "transcribe_batch":
-        cmd = [str(HELPERS_DIR / "transcribe_batch.py"), args["videos_dir"]]
+        # Always use the session videos_dir to prevent operating outside it
+        cmd = [str(HELPERS_DIR / "transcribe_batch.py"), str(videos_dir)]
         if args.get("edit_dir"):
             cmd += ["--edit-dir", args["edit_dir"]]
         if args.get("workers"):
@@ -387,7 +415,7 @@ def dispatch_tool(
         return _format_result(rc, out, err), None
 
     if name == "pack_transcripts":
-        cmd = [str(HELPERS_DIR / "pack_transcripts.py"), "--edit-dir", args["edit_dir"]]
+        cmd = [str(HELPERS_DIR / "pack_transcripts.py"), "--edit-dir", args.get("edit_dir") or str(edit_dir)]
         if args.get("silence_threshold") is not None:
             cmd += ["--silence-threshold", str(args["silence_threshold"])]
         rc, out, err = _run_helper(cmd)
@@ -449,6 +477,12 @@ def dispatch_tool(
         return _format_result(rc, out, err), None
 
     if name == "bash":
+        if not enable_bash:
+            return (
+                "[bash tool is disabled by default. Restart the orchestrator with "
+                "--enable-bash to allow shell commands.]",
+                None,
+            )
         command = args["command"]
         proc = subprocess.run(
             command,
@@ -460,7 +494,9 @@ def dispatch_tool(
         return _format_result(proc.returncode, proc.stdout, proc.stderr), None
 
     if name == "read_file":
-        path = Path(args["path"])
+        path = Path(args["path"]).resolve()
+        if not (_is_under(path, videos_dir) or _is_under(path, edit_dir)):
+            return f"Access denied: path must be under {videos_dir} or {edit_dir}", None
         if not path.exists():
             return f"File not found: {path}", None
         try:
@@ -469,7 +505,9 @@ def dispatch_tool(
             return f"Error reading file: {e}", None
 
     if name == "write_file":
-        path = Path(args["path"])
+        path = Path(args["path"]).resolve()
+        if not _is_under(path, edit_dir):
+            return f"Access denied: write path must be under {edit_dir}", None
         path.parent.mkdir(parents=True, exist_ok=True)
         mode = "a" if args.get("append") else "w"
         try:
@@ -487,13 +525,47 @@ def dispatch_tool(
 # ---------------------------------------------------------------------------
 
 
+# Maximum image size (bytes) to embed in chat; larger images are downscaled first.
+MAX_IMAGE_BYTES = 1_500_000  # 1.5 MB
+
+
 def _build_image_message(img_path: Path) -> dict:
-    b64 = base64.b64encode(img_path.read_bytes()).decode()
+    """Embed a timeline image as a base64 data URL, downscaling via ffmpeg if needed."""
+    raw = img_path.read_bytes()
+    mime = "image/png"
+    if len(raw) > MAX_IMAGE_BYTES:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(img_path),
+                    "-vf", "scale='min(960,iw)':-2",
+                    str(tmp_path),
+                ],
+                capture_output=True,
+                check=False,
+            )
+            raw = tmp_path.read_bytes()
+            mime = "image/jpeg"
+        except Exception:
+            pass
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    if len(raw) > MAX_IMAGE_BYTES:
+        return {
+            "role": "user",
+            "content": (
+                f"[Timeline image too large to embed ({len(raw):,} bytes); "
+                f"saved to: {img_path}]"
+            ),
+        }
+    b64 = base64.b64encode(raw).decode()
     return {
         "role": "user",
         "content": [
             {"type": "text", "text": f"[Timeline view image: {img_path.name}]"},
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
         ],
     }
 
@@ -503,6 +575,7 @@ def run_session(
     model: str,
     endpoint: str,
     max_turns: int,
+    enable_bash: bool = False,
 ) -> None:
     try:
         from openai import OpenAI
@@ -513,6 +586,7 @@ def run_session(
             "or:            pip install openai"
         )
 
+    _load_env_file()
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not github_token:
         sys.exit(
@@ -613,6 +687,10 @@ def run_session(
         messages.append(msg_dict)
 
         if message.tool_calls:
+            # Show any explanation the model included alongside the tool calls
+            if message.content:
+                print(f"\nAssistant: {message.content}\n")
+
             # Execute every requested tool call
             image_paths: list[Path] = []
 
@@ -621,7 +699,15 @@ def run_session(
                 try:
                     tool_args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
-                    tool_args = {}
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": (
+                            f"[Invalid JSON in tool arguments — could not parse. "
+                            f"Raw arguments: {tc.function.arguments!r}. Please retry with valid JSON.]"
+                        ),
+                    })
+                    continue
 
                 # Pretty-print what we're doing
                 args_preview = ", ".join(
@@ -630,7 +716,7 @@ def run_session(
                 print(f"  [tool] {tool_name}({args_preview})", flush=True)
 
                 result_text, image_path = dispatch_tool(
-                    tool_name, tool_args, videos_dir, edit_dir
+                    tool_name, tool_args, videos_dir, edit_dir, enable_bash=enable_bash
                 )
 
                 # Truncate very long results so we don't blow the context window
@@ -725,6 +811,15 @@ def main() -> None:
         default=100,
         help="Maximum LLM turns before the session ends (default: 100).",
     )
+    ap.add_argument(
+        "--enable-bash",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable the bash tool (disabled by default). "
+            "Only enable when you trust the model and understand the security implications."
+        ),
+    )
     args = ap.parse_args()
 
     videos_dir = args.videos_dir.resolve()
@@ -736,6 +831,7 @@ def main() -> None:
         model=args.model,
         endpoint=args.endpoint,
         max_turns=args.max_turns,
+        enable_bash=args.enable_bash,
     )
 
 
